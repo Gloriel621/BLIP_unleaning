@@ -7,7 +7,7 @@
 '''
 import argparse
 import os
-import ruamel_yaml as yaml
+import ruamel.yaml as yaml
 import numpy as np
 import random
 import time
@@ -28,7 +28,7 @@ from utils import warmup_lr_schedule, step_lr_schedule
 from data import create_dataset, create_sampler, create_loader
 
 def train(model, data_loader, optimizer, epoch, device, config):
-    # train
+
     model.train()  
     
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -54,8 +54,9 @@ def train(model, data_loader, optimizer, epoch, device, config):
         
         image = image.to(device,non_blocking=True)
         
-        # ramp up alpha in the first 2 epochs
-        alpha = config['alpha']*min(1,(epoch*len(data_loader)+i)/(2*len(data_loader))) 
+        # # ramp up alpha in the first 2 epochs
+        # alpha = config['alpha']*min(1,(epoch*len(data_loader)+i)/(2*len(data_loader))) 
+        alpha = config['alpha']
 
         loss_ita, loss_itm, loss_lm = model(image, caption, alpha = alpha)  
         loss = loss_ita + loss_itm + loss_lm  
@@ -139,8 +140,18 @@ def main(args, config):
                 'config': config,
                 'epoch': epoch,
             }
-            torch.save(save_obj, os.path.join(args.output_dir, 'checkpoint_%02d.pth'%epoch))  
-            
+            current_checkpoint_path = os.path.join(args.output_dir, 'checkpoint_%02d.pth' % epoch)
+
+            # Path for previous epoch checkpoint
+            previous_checkpoint_path = os.path.join(args.output_dir, 'checkpoint_%02d.pth' % (epoch - 1))
+
+            # Save current epoch checkpoint
+            torch.save(save_obj, current_checkpoint_path)
+
+            # Remove previous checkpoint if it exists
+            if os.path.exists(previous_checkpoint_path):
+                os.remove(previous_checkpoint_path)
+
             with open(os.path.join(args.output_dir, "log.txt"),"a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 

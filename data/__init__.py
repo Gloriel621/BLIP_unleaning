@@ -1,5 +1,7 @@
+import numpy as np
+
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision import transforms
 from torchvision.transforms.functional import InterpolationMode
 
@@ -97,5 +99,62 @@ def create_loader(datasets, samplers, batch_size, num_workers, is_trains, collat
             drop_last=drop_last,
         )              
         loaders.append(loader)
-    return loaders    
+    return loaders
+
+def create_split_samplers(datasets, num_tasks, global_rank, split_ratio):
+    forget_samplers = []
+    retain_samplers = []
+    split_index = [int(len(dataset) * split_ratio) for dataset in datasets]
+
+    for dataset, index in zip(datasets, split_index):
+        forget_sampler = torch.utils.data.DistributedSampler(
+            torch.utils.data.Subset(dataset, range(0, index)),
+            num_replicas=num_tasks,
+            rank=global_rank,
+            shuffle=True
+        )
+        retain_sampler = torch.utils.data.DistributedSampler(
+            torch.utils.data.Subset(dataset, range(index, len(dataset))),
+            num_replicas=num_tasks,
+            rank=global_rank,
+            shuffle=True
+        )
+        forget_samplers.append(forget_sampler)
+        retain_samplers.append(retain_sampler)
+
+    return forget_samplers, retain_samplers
+
+def create_split_loaders(datasets, num_tasks, global_rank, batch_size, num_workers, split_ratio=0.01):
+    forget_samplers, retain_samplers = create_split_samplers(datasets, num_tasks, global_rank, split_ratio)
+    loaders = []
+
+    for forget_dataset, retain_dataset, forget_sampler, retain_sampler, bs, n_worker in zip(
+            [torch.utils.data.Subset(ds, range(0, int(len(ds) * split_ratio))) for ds in datasets],
+            [torch.utils.data.Subset(ds, range(int(len(ds) * split_ratio), len(ds))) for ds in datasets],
+            forget_samplers,
+            retain_samplers,
+            batch_size * len(datasets),
+            num_workers * len(datasets)):
+
+        forget_loader = DataLoader(
+            forget_dataset,
+            batch_size=bs,
+            num_workers=n_worker,
+            pin_memory=True,
+            sampler=forget_sampler,
+            shuffle=False,
+            drop_last=True,
+        )
+        retain_loader = DataLoader(
+            retain_dataset,
+            batch_size=bs,
+            num_workers=n_worker,
+            pin_memory=True,
+            sampler=retain_sampler,
+            shuffle=False,
+            drop_last=True,
+        )
+        loaders.append((forget_loader, retain_loader))
+
+    return loaders
 

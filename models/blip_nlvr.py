@@ -67,7 +67,7 @@ class BLIP_NLVR(nn.Module):
 def blip_nlvr(pretrained='',**kwargs):
     model = BLIP_NLVR(**kwargs)
     if pretrained:
-        model,msg = load_checkpoint(model,pretrained)
+        model,msg = load_checkpoint(model, pretrained)
         print("missing keys:")
         print(msg.missing_keys)
     return model  

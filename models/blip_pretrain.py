@@ -131,7 +131,10 @@ class BLIP_Pretrain(nn.Module):
 
         sim_i2t = image_feat @ text_feat_all / self.temp
         sim_t2i = text_feat @ image_feat_all / self.temp
-                             
+
+        #### ITA LOSS ####
+        # = loss_i2t + loss_t2i 
+        # contrastive loss 2개의 합.                 
         loss_i2t = -torch.sum(F.log_softmax(sim_i2t, dim=1)*sim_i2t_targets,dim=1).mean()
         loss_t2i = -torch.sum(F.log_softmax(sim_t2i, dim=1)*sim_t2i_targets,dim=1).mean() 
 
@@ -193,13 +196,18 @@ class BLIP_Pretrain(nn.Module):
 
         itm_labels = torch.cat([torch.ones(bs,dtype=torch.long),torch.zeros(2*bs,dtype=torch.long)],
                                dim=0).to(image.device)
+        
+        #### ITM LOSS ####
+        # = classification loss. 
         loss_itm = F.cross_entropy(vl_output, itm_labels)  
         
         ##================= LM ========================##     
         decoder_input_ids = text.input_ids.clone()      
         decoder_input_ids[:,0] = self.tokenizer.bos_token_id
         decoder_targets = decoder_input_ids.masked_fill(decoder_input_ids == self.tokenizer.pad_token_id, -100) 
+        
 
+        #### LM LOSS ####
         decoder_output = self.text_decoder(decoder_input_ids, 
                                            attention_mask = text.attention_mask, 
                                            encoder_hidden_states = image_embeds,
@@ -247,8 +255,11 @@ class BLIP_Pretrain(nn.Module):
         self.queue_ptr[0] = ptr 
 
 
-def blip_pretrain(**kwargs):
+def blip_pretrain(pretrained=None, **kwargs):
     model = BLIP_Pretrain(**kwargs)
+    if pretrained is not None:
+        model, msg = load_checkpoint(model, pretrained)
+        assert(len(msg.missing_keys)==0)
     return model 
 
 
