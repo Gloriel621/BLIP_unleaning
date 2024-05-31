@@ -54,9 +54,8 @@ def train(model, data_loader, optimizer, epoch, device, config):
         
         image = image.to(device,non_blocking=True)
         
-        # # ramp up alpha in the first 2 epochs
-        # alpha = config['alpha']*min(1,(epoch*len(data_loader)+i)/(2*len(data_loader))) 
-        alpha = config['alpha']
+        # ramp up alpha in the first 2 epochs
+        alpha = config['alpha']*min(1,(epoch*len(data_loader)+i)/(2*len(data_loader))) 
 
         loss_ita, loss_itm, loss_lm = model(image, caption, alpha = alpha)  
         loss = loss_ita + loss_itm + loss_lm  

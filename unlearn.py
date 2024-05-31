@@ -6,11 +6,13 @@ import random
 import time
 import datetime
 import json
+import copy
 from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+import torch.nn.functional as F
 import torch.nn.utils.clip_grad as clip_grad
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
@@ -20,14 +22,22 @@ import utils
 from utils import warmup_lr_schedule, step_lr_schedule
 from data import create_dataset, create_split_loaders
 
-def unlearn(model, data_loader, optimizer, epoch, device, config):
+def discrepancy_loss(original_repr, unlearned_repr):
+    return F.mse_loss(original_repr, unlearned_repr)
+
+def unlearn(model, original_model, data_loader, optimizer, epoch, device, config, lambda1, lambda2, lambda3):
     model.train()
+    original_model.eval()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=50, fmt='{value:.6f}'))
     metric_logger.add_meter('loss_ita', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('loss_itm', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))    
+    metric_logger.add_meter('loss_itm', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_lm', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('discrepancy_loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('lambda1', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('lambda2', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
+    metric_logger.add_meter('lambda3', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
 
     header = 'Unlearn Epoch: [{}]'.format(epoch)
     print_freq = 10
@@ -47,9 +57,21 @@ def unlearn(model, data_loader, optimizer, epoch, device, config):
 
             alpha = adjust_alpha(epoch, i, len(data_loader), 'unlearn', config)
 
-            loss_ita, loss_itm, loss_lm = model(image, caption, alpha=alpha)
-            # negative gradient
-            loss = -(loss_ita + loss_itm + loss_lm) 
+            loss_ita, loss_itm, loss_lm, image_repr, text_repr = model(image, caption, alpha=alpha)
+            # negative gradient with adaptive lambdas
+            loss = -(lambda1 * loss_ita + lambda2 * loss_itm + lambda3 * loss_lm)
+
+            # Get original model representations
+            with torch.no_grad():
+                _, _, _, original_image_repr, original_text_repr = original_model(image, caption, alpha=alpha)
+
+            # Add custom discrepancy loss
+            image_disc_loss = discrepancy_loss(original_image_repr, image_repr)
+            text_disc_loss = discrepancy_loss(original_text_repr, text_repr)
+            disc_loss = image_disc_loss + text_disc_loss
+
+            disc_lambda = config.get('disc_lambda', 1)
+            loss += disc_lambda * disc_loss
 
             loss.backward()
 
@@ -60,6 +82,10 @@ def unlearn(model, data_loader, optimizer, epoch, device, config):
             metric_logger.update(loss_ita=loss_ita.item())
             metric_logger.update(loss_itm=loss_itm.item())
             metric_logger.update(loss_lm=loss_lm.item())
+            metric_logger.update(discrepancy_loss=disc_loss.item())
+            metric_logger.update(lambda1=lambda1.item())
+            metric_logger.update(lambda2=lambda2.item())
+            metric_logger.update(lambda3=lambda3.item())
             metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         except Exception as e:
@@ -98,7 +124,7 @@ def retrain(model, data_loader, optimizer, epoch, device, config):
         # ramp up alpha in the first 2 epochs
         alpha = adjust_alpha(epoch, i, len(data_loader), 'retrain', config)
 
-        loss_ita, loss_itm, loss_lm = model(image, caption, alpha = alpha)  
+        loss_ita, loss_itm, loss_lm, _, __ = model(image, caption, alpha = alpha)  
         loss = loss_ita + loss_itm + loss_lm  
 
         loss.backward()
@@ -128,17 +154,15 @@ def evaluate(model, data_loader, device, alpha=0.0):
         for batch_number, (images, captions) in enumerate(data_loader):
             images = images.to(device, non_blocking=True)
             # Using the alpha value directly in the model's inference call
-            loss_ita, loss_itm, loss_lm = model(images, captions, alpha=alpha)
+            loss_ita, loss_itm, loss_lm, _, __ = model(images, captions, alpha=alpha)
 
             metric_logger.update(loss_ita=loss_ita.item())
             metric_logger.update(loss_itm=loss_itm.item())
             metric_logger.update(loss_lm=loss_lm.item())
             metric_logger.update(lr=0)
 
-            if batch_number % 10 == 0:
-                print(f'Batch {batch_number}:', metric_logger)
-
     print("Final Evaluation Results:")
+    
     for key, meter in metric_logger.meters.items():
         print(f"{key}: {meter.global_avg:.4f}")
 
@@ -168,7 +192,7 @@ def main(args, config):
     num_tasks = utils.get_world_size()
     global_rank = utils.get_rank()
 
-    loaders = create_split_loaders(datasets, num_tasks, global_rank, [config['batch_size']], [4])
+    loaders = create_split_loaders(datasets, num_tasks, global_rank, [config['batch_size']], [4], split_ratio=0.005)
 
     forget_loader, retain_loader = loaders[0] 
 
@@ -179,7 +203,24 @@ def main(args, config):
         model = blip_pretrain(pretrained=config['pretrained'], image_size=config['image_size'],
                               vit=config['vit'], vit_grad_ckpt=config['vit_grad_ckpt'], 
                               vit_ckpt_layer=config['vit_ckpt_layer'], queue_size=config['queue_size'])
+        original_model = copy.deepcopy(model)
         model = model.to(device)
+        original_model = original_model.to(device)
+
+        optimizer = torch.optim.AdamW([
+        {'params': model.parameters(), 'lr': base_lr},
+        {'params': [lambda1, lambda2, lambda3], 'lr': lambda_lr}
+        ], weight_decay=config['weight_decay'])
+
+    # Initialize lambda values as learnable parameters
+    lambda1 = torch.nn.Parameter(torch.tensor(1.0, requires_grad=True))
+    lambda2 = torch.nn.Parameter(torch.tensor(1.0, requires_grad=True))
+    lambda3 = torch.nn.Parameter(torch.tensor(1.0, requires_grad=True))
+
+    # Define different learning rates for model parameters and lambda parameters
+    base_lr = config['init_lr']
+    lambda_lr = 1  # Set a different learning rate for lambda parameters
+
 
     if args.checkpoint:    
         checkpoint = torch.load(args.checkpoint, map_location='cpu') 
@@ -192,19 +233,21 @@ def main(args, config):
             baseline_model = blip_pretrain(pretrained=config['pretrained'], image_size=config['image_size'],
                               vit=config['vit'], vit_grad_ckpt=config['vit_grad_ckpt'], 
                               vit_ckpt_layer=config['vit_ckpt_layer'], queue_size=config['queue_size'])
-            baseline_model = model.to(device)
+            baseline_model = baseline_model.to(device)
             unlearned_model = blip_pretrain(pretrained=config['unlearned'], image_size=config['image_size'],
                                              vit=config['vit'], vit_grad_ckpt=config['vit_grad_ckpt'], 
                                              vit_ckpt_layer=config['vit_ckpt_layer'], queue_size=config['queue_size'])
             unlearned_model = unlearned_model.to(device)   
   
         print("Evaluating the unlearned model...")
+        print("Baseline model + forget set")
         evaluate(baseline_model, forget_loader, device)
+        print("Unlearned model + forget set")
         evaluate(unlearned_model, forget_loader, device) 
 
-        # use 10% of retain set to evaluate
+        # use 5% of retain set to evaluate
         retain_size = len(retain_loader.dataset)
-        subset_size = int(0.1 * retain_size)
+        subset_size = int(0.05 * retain_size)
         sampled_indices = np.random.choice(retain_size, size=subset_size, replace=False)
         sampled_retain_set = Subset(retain_loader.dataset, sampled_indices)
 
@@ -216,12 +259,12 @@ def main(args, config):
             drop_last=True
         )
 
+        print("Unlearned model + retain set 5%")
         evaluate(unlearned_model, sampled_retain_loader, device)
   
          
     else:
         # Unlearn mode. 
-        optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['init_lr'], weight_decay=config['weight_decay'])
         start_epoch = 0
         if args.checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
@@ -239,7 +282,7 @@ def main(args, config):
             
             step_lr_schedule(optimizer, epoch, config['init_lr'], config['min_lr'], config['lr_decay_rate'])
                     
-            unlearn_stats = unlearn(model, forget_loader, optimizer, epoch, device, config)
+            unlearn_stats = unlearn(model, original_model, forget_loader, optimizer, epoch, device, config, lambda1, lambda2, lambda3)
 
             subset_size = len(forget_loader.dataset)
             sampled_indices = np.random.choice(len(retain_loader.dataset), size=subset_size * 2, replace=False)
@@ -260,7 +303,10 @@ def main(args, config):
                 log_stats = {
                     **{f'unlearn_{k}': v for k, v in unlearn_stats.items()},
                     **{f'retrain_{k}': v for k, v in retrain_stats.items()},
-                    'epoch': epoch
+                    'epoch': epoch,
+                    'lambda1': lambda1.item(),
+                    'lambda2': lambda2.item(),
+                    'lambda3': lambda3.item(),
                 }                 
                 save_obj = {
                     'model': model_without_ddp.state_dict(),

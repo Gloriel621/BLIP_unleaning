@@ -124,7 +124,7 @@ def create_split_samplers(datasets, num_tasks, global_rank, split_ratio):
 
     return forget_samplers, retain_samplers
 
-def create_split_loaders(datasets, num_tasks, global_rank, batch_size, num_workers, split_ratio=0.01):
+def create_split_loaders(datasets, num_tasks, global_rank, batch_size, num_workers, split_ratio):
     forget_samplers, retain_samplers = create_split_samplers(datasets, num_tasks, global_rank, split_ratio)
     loaders = []
 
